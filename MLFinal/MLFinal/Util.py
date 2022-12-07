@@ -1,10 +1,13 @@
 import re
 import torch
+from polyleven import levenshtein
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 class Vocab():
     def __init__(self):
         #these values set for the purpose of ensuring they're not used on accident by other words.
-        self.sToI = {"<PAD>": 0, "": 1}     
+        self.sToI = {"<PAD>": 0, "": 1}
+        self.iToS = {}
         self.frequencies = {}
         self.length = -1
 
@@ -17,6 +20,18 @@ class Vocab():
             else:
                 if key not in self.sToI.keys():
                     self.sToI[key] = len(self.sToI)
+        self.PopulateIToS()
+
+    def PopulateIToS(self):
+        for key,value in self.sToI.items():
+            self.iToS[value] = key
+
+    def NumToString(self, data):
+        output = []
+        for value in data:
+            output.append(self.iToS[int(value)])
+
+        return output
     
     def CalcFreq(self, data):
         #standardization of words of removing double spaces isolated by the .split()
@@ -32,10 +47,11 @@ class Vocab():
         if "" in self.frequencies:
             del self.frequencies[""]
 
-    def MakeNumbers(self, data1, data2, labels, hasLabels):
+    def MakeNumbers(self, data1, data2, labels, hasLabels, isTraining):
         output1 = []
         output2 = []
-        
+        newLabels = []
+
         length = 0
         
         #convert each word into an ID value for the tensor
@@ -44,8 +60,8 @@ class Vocab():
             temp2 = []
             for word in data1[i].split(" "):
                 word = word.strip()
-                #scrub out single letter words except for "I", and all possessive articles that can be interchanged
-                if word != "":
+                #scrub out single letter words
+                if word != "" and len(word) > 1:
                     temp1.append(self.sToI[word])
 
             if len(temp1) > self.length:
@@ -62,19 +78,22 @@ class Vocab():
             #add the data in so even index is temp1, odd index is temp2
             output1.append(torch.FloatTensor(temp1))
             output2.append(torch.FloatTensor(temp2))
-            
-            if hasLabels and labels[i] == 1:
+            if(hasLabels):
+                newLabels.append(labels[i])
+            if hasLabels and labels[i] == 1 and isTraining:
                 output1.append(torch.FloatTensor(temp1))
                 output2.append(torch.FloatTensor(temp2))
-                labels.insert(i,1)
-                
-        return output1, output2, labels
+                output1.append(torch.FloatTensor(temp1))
+                output2.append(torch.FloatTensor(temp2))
+                newLabels.append(labels[i])
+                newLabels.append(labels[i])
+        return output1, output2, newLabels
 
 
 
 class Util():
     @staticmethod
-    def PreProcess(fileName):
+    def PreProcess(fileName, isTraining):
         f = open(fileName, "r", encoding="utf8")
 
         label = []
@@ -93,7 +112,7 @@ class Util():
             line = f.readline()
 
         f.close()
-
+        
         for i in range(len(label)):
             #remove case sensitivity
             test1[i] = test1[i].lower()
@@ -110,9 +129,9 @@ class Util():
         vocab.CalcFreq(test2)
 
         vocab.RefineFreq(1)
-        processed1, processed2, label = vocab.MakeNumbers(test1, test2, label, len(label) > 0)
+        processed1, processed2, label = vocab.MakeNumbers(test1, test2, label, len(label) > 0, isTraining)
         
-        return vocab.length,label, processed1, processed2
+        return vocab,label, processed1, processed2
     
     @staticmethod 
     def PadSize(length, data1, data2):
@@ -127,3 +146,44 @@ class Util():
                 temp.append(0)
             data2[i] = torch.FloatTensor(temp)
 
+    @staticmethod
+    def AddFeatures(data1, data2, vocab):
+        output = []
+        for i in range(len(data1)):
+            temp = []
+            #list of strings
+            tempSentence1 = vocab.NumToString(list(data1[i]))
+            tempSentence2 = vocab.NumToString(list(data2[i]))
+            
+            #list of ints
+            tempNums1 = list(data1[i])
+            for i in range(len(tempNums1)):
+                tempNums1[i] = int(tempNums1[i])
+
+            tempNums2 = list(data2[i])
+            for i in range(len(tempNums2)):
+                tempNums2[i] = int(tempNums2[i])
+
+
+            #FEATURE: number of words similar between them via word bag.
+            #because there are so many words, there can be some astronomically high values. Will normalize between 0 and 1 to be more in range with other features
+            values1 = sum(tempNums1)
+            values2 = sum(tempNums2)
+            total = values1 + values2
+            values1 /= total
+            values2 /= total
+
+            temp.append(values1*2)
+            temp.append(values2*2)
+
+            #FEATURE: Levenshtein distance
+            lev = levenshtein(" ".join(tempSentence1)," ".join(tempSentence2))
+
+            #FEATURE: BLEU scores
+            bleu = sentence_bleu(tempSentence1, tempSentence2, smoothing_function = SmoothingFunction().method4)
+
+            temp.append(lev)
+
+            output.append(torch.FloatTensor(temp))
+
+        return output
